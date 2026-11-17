@@ -6,8 +6,10 @@ const POLL_INTERVAL_MS = 80;
 const MAX_CLIENT_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_UPSTREAM_BODY_BYTES = 4 * 1024 * 1024;
 const MAX_ATTEMPTS_PER_PROMPT = 5;
-const ATTEMPT_TIMEOUT_MS = 5400;
-const RETRY_BACKOFF_MS = 200;
+const ATTEMPT_TIMEOUTS_MS = [11000, 6500, 4500, 3000, 2500] as const;
+const RATE_LIMIT_BACKOFF_MS = 650;
+const SERVER_ERROR_BACKOFF_MS = 250;
+const COOLDOWN_FAILURE_THRESHOLD = 3;
 const MAX_TRAIL_ITEMS = 8;
 const MAX_CODE_LENGTH = 64;
 
@@ -99,6 +101,7 @@ interface ModelRuntimeHealth {
   dead: boolean;
   noJson: boolean;
   noTools: boolean;
+  consecutiveFailures: number;
   strikes: number;
   wins: number;
 }
@@ -644,6 +647,7 @@ function parseJsonCompletion(rawText: string): { ok: true; completion: Normalize
 function parseSseCompletion(rawText: string): { ok: true; completion: NormalizedCompletion } | { ok: false; inBandStatus: number | null; inBandCode: string } {
   const normalized = rawText.replace(/\r\n/g, '\n');
   let sawAnyChunk = false;
+  let sawDone = false;
   let id = 'chatcmpl-stream';
   const textChunks: string[] = [];
   let rawFinish: unknown = null;
@@ -661,7 +665,11 @@ function parseSseCompletion(rawText: string): { ok: true; completion: Normalized
     }
     if (dataLines.length === 0) continue;
     const payload = dataLines.join('\n').trim();
-    if (payload === '' || payload === '[DONE]') continue;
+    if (payload === '') continue;
+    if (payload === '[DONE]') {
+      sawDone = true;
+      continue;
+    }
 
     let chunk: unknown;
     try {
@@ -715,7 +723,7 @@ function parseSseCompletion(rawText: string): { ok: true; completion: Normalized
     }
   }
 
-  if (!sawAnyChunk) {
+  if (!sawAnyChunk || (!sawDone && rawFinish === null)) {
     return { ok: false, inBandStatus: null, inBandCode: '' };
   }
 
@@ -1015,7 +1023,7 @@ function gatewayChatUrl(): string {
 function getHealth(modelId: string): ModelRuntimeHealth {
   let h = healthMap.get(modelId);
   if (h === undefined) {
-    h = { dead: false, noJson: false, noTools: false, strikes: 0, wins: 0 };
+    h = { dead: false, noJson: false, noTools: false, consecutiveFailures: 0, strikes: 0, wins: 0 };
     healthMap.set(modelId, h);
   }
   return h;
@@ -1034,8 +1042,11 @@ function rankCandidates(req: PromptRequirement): ModelSpec[] {
   eligible.sort((a, b) => {
     const ha = getHealth(a.id);
     const hb = getHealth(b.id);
-    if (ha.strikes !== hb.strikes) return ha.strikes - hb.strikes;
+    const coolA = ha.consecutiveFailures >= COOLDOWN_FAILURE_THRESHOLD ? 1 : 0;
+    const coolB = hb.consecutiveFailures >= COOLDOWN_FAILURE_THRESHOLD ? 1 : 0;
+    if (coolA !== coolB) return coolA - coolB;
     if (a.ratingMilli !== b.ratingMilli) return b.ratingMilli - a.ratingMilli;
+    if (ha.strikes !== hb.strikes) return ha.strikes - hb.strikes;
     if (ha.wins !== hb.wins) return hb.wins - ha.wins;
     return a.order - b.order;
   });
@@ -1163,6 +1174,10 @@ function nextPromptRequirement(wire: WireKind, stream: boolean, clientBody: Json
   return bodyReq;
 }
 
+function isTransientUpstreamStatus(status: number): boolean {
+  return status === 429 || status === 408 || status >= 500;
+}
+
 function recordModelFailure(modelId: string, status: number, code: string, req: PromptRequirement): void {
   const h = getHealth(modelId);
   if (status === 402 || status === 403 || status === 404 || status === 410 || code === 'model_not_allowed') {
@@ -1170,13 +1185,35 @@ function recordModelFailure(modelId: string, status: number, code: string, req: 
     return;
   }
   if (status === 400 || status === 422) {
+    // Scope format/tool incompatibilities without penalizing unrelated prompt classes.
     if (req.json) h.noJson = true;
     else if (req.tools) h.noTools = true;
     else h.dead = true;
-    h.strikes += 2;
     return;
   }
+  h.consecutiveFailures += 1;
   h.strikes += 1;
+}
+
+function recordTransportDrop(modelId: string, exhaustedIds: Set<string>): void {
+  exhaustedIds.add(modelId);
+  const h = getHealth(modelId);
+  h.consecutiveFailures += 1;
+  h.strikes += 2;
+}
+
+function shouldRetrySameModel(
+  chosen: ModelSpec,
+  req: PromptRequirement,
+  exhaustedIds: ReadonlySet<string>,
+  triesByModel: ReadonlyMap<string, number>,
+): boolean {
+  if ((triesByModel.get(chosen.id) ?? 0) >= 2) return false;
+  const h = getHealth(chosen.id);
+  if (h.dead || (req.json && h.noJson) || (req.tools && h.noTools)) return false;
+  if (h.consecutiveFailures >= COOLDOWN_FAILURE_THRESHOLD) return false;
+  const nextDistinct = rankCandidates(req).find((m) => m.id !== chosen.id && !exhaustedIds.has(m.id));
+  return nextDistinct === undefined || chosen.ratingMilli > nextDistinct.ratingMilli;
 }
 
 async function serveCompletion(wire: WireKind, req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -1198,7 +1235,8 @@ async function serveCompletion(wire: WireKind, req: IncomingMessage, res: Server
   }
 
   const trail: FailureTrailItem[] = [];
-  const triedIds = new Set<string>();
+  const exhaustedIds = new Set<string>();
+  const triesByModel = new Map<string, number>();
   let fallbackValidShape: { completion: NormalizedCompletion; modelId: string } | null = null;
   let lastHttpStatus = 502;
   let lastErrorCode = wire === 'anthropic' ? 'api_error' : 'upstream_error';
@@ -1206,17 +1244,18 @@ async function serveCompletion(wire: WireKind, req: IncomingMessage, res: Server
 
   for (let attempt = 0; attempt < MAX_ATTEMPTS_PER_PROMPT; attempt++) {
     const rankedNow = rankCandidates(requires);
-    const chosen = rankedNow.find((m) => !triedIds.has(m.id)) ?? rankedNow[0];
+    const chosen = rankedNow.find((m) => !exhaustedIds.has(m.id)) ?? rankedNow[0];
     if (chosen === undefined) break;
-    triedIds.add(chosen.id);
+    triesByModel.set(chosen.id, (triesByModel.get(chosen.id) ?? 0) + 1);
 
     const upstreamPayload =
       wire === 'openai'
         ? buildOpenAIUpstreamBody(clientBody, chosen.id, stream)
         : buildOpenAIFromAnthropic(clientBody, chosen.id, stream);
 
+    const timeoutMs = ATTEMPT_TIMEOUTS_MS[attempt] ?? 2500;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), ATTEMPT_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     const headers: Record<string, string> = {
       'content-type': 'application/json',
       authorization: `Bearer ${GATEWAY_KEY}`,
@@ -1234,7 +1273,7 @@ async function serveCompletion(wire: WireKind, req: IncomingMessage, res: Server
     } catch {
       clearTimeout(timer);
       // Normalized identically with HTTP 499 so live client-timeout and replay 499 follow the exact same path.
-      getHealth(chosen.id).strikes += 2;
+      recordTransportDrop(chosen.id, exhaustedIds);
       lastHttpStatus = 504;
       lastErrorDetail = `${chosen.id} timed out or could not be reached`;
       continue;
@@ -1244,7 +1283,7 @@ async function serveCompletion(wire: WireKind, req: IncomingMessage, res: Server
     clearTimeout(timer);
 
     if (response.status === 499) {
-      getHealth(chosen.id).strikes += 2;
+      recordTransportDrop(chosen.id, exhaustedIds);
       lastHttpStatus = 504;
       lastErrorDetail = `${chosen.id} closed before completing`;
       continue;
@@ -1265,14 +1304,24 @@ async function serveCompletion(wire: WireKind, req: IncomingMessage, res: Server
       }
 
       recordModelFailure(chosen.id, response.status, code, requires);
-      if (response.status === 429 && attempt + 1 < MAX_ATTEMPTS_PER_PROMPT) {
-        await delay(RETRY_BACKOFF_MS);
+      const retrySame =
+        isTransientUpstreamStatus(response.status) &&
+        shouldRetrySameModel(chosen, requires, exhaustedIds, triesByModel);
+      if (!retrySame) {
+        exhaustedIds.add(chosen.id);
+      }
+      if (attempt + 1 < MAX_ATTEMPTS_PER_PROMPT) {
+        if (response.status === 429) {
+          await delay(RATE_LIMIT_BACKOFF_MS);
+        } else if (retrySame) {
+          await delay(SERVER_ERROR_BACKOFF_MS);
+        }
       }
       continue;
     }
 
     if (!readResult.ok) {
-      getHealth(chosen.id).strikes += 2;
+      recordTransportDrop(chosen.id, exhaustedIds);
       lastHttpStatus = 502;
       lastErrorDetail = `${chosen.id} stream broke mid-response`;
       continue;
@@ -1285,8 +1334,21 @@ async function serveCompletion(wire: WireKind, req: IncomingMessage, res: Server
           trail.push({ status: parsed.inBandStatus, code: parsed.inBandCode, model: chosen.id });
         }
         recordModelFailure(chosen.id, parsed.inBandStatus, parsed.inBandCode, requires);
+        const retrySame =
+          isTransientUpstreamStatus(parsed.inBandStatus) &&
+          shouldRetrySameModel(chosen, requires, exhaustedIds, triesByModel);
+        if (!retrySame) {
+          exhaustedIds.add(chosen.id);
+        }
+        if (attempt + 1 < MAX_ATTEMPTS_PER_PROMPT) {
+          if (parsed.inBandStatus === 429) {
+            await delay(RATE_LIMIT_BACKOFF_MS);
+          } else if (retrySame) {
+            await delay(SERVER_ERROR_BACKOFF_MS);
+          }
+        }
       } else {
-        getHealth(chosen.id).strikes += 2;
+        recordTransportDrop(chosen.id, exhaustedIds);
       }
       lastHttpStatus = parsed.inBandStatus ?? 502;
       lastErrorDetail = `${chosen.id} returned an unreadable completion`;
@@ -1295,12 +1357,18 @@ async function serveCompletion(wire: WireKind, req: IncomingMessage, res: Server
 
     if (!validateCompletion(parsed.completion, expectedToken, declaredTools)) {
       logInfo(`attempt ${attempt + 1}: ${chosen.id} answered HTTP 200 without matching token/tools; failing over`);
-      getHealth(chosen.id).strikes += 2;
+      const h = getHealth(chosen.id);
+      h.consecutiveFailures += 1;
+      h.strikes += 1;
+      if (!shouldRetrySameModel(chosen, requires, exhaustedIds, triesByModel)) {
+        exhaustedIds.add(chosen.id);
+      }
       fallbackValidShape ??= { completion: parsed.completion, modelId: chosen.id };
       continue;
     }
 
     const h = getHealth(chosen.id);
+    h.consecutiveFailures = 0;
     h.strikes = 0;
     h.wins += 1;
 
